@@ -1,0 +1,397 @@
+<html>
+<head>
+  <title>Dungeon Generator Example</title>
+  <style>
+    .form-field { display: flex; }
+    .form-field label {
+      display:block;
+      width: 5em;
+    }
+    .form-field input {
+      display:block;
+      flex-grow: 1;
+    }
+    .form-field input + span {
+      display: block;
+      flex-grow: 0;
+      width: 2em;
+    }
+    code {
+      display: inline-block;
+      padding: .1em .3em;
+      border-radius: .1em;
+      border: 1px solid #333;
+      font-family: monospace;
+      font-size: 1.2em;
+      background: #222;
+    }
+  </style>
+</head>
+<body style="background:black;color:#888;">
+<div><canvas id="canvas" width="1280" height="720"/></div>
+<p style="text-align:center">Click dungeon to generate new dungeon.<br/>Change values to generate new dungeon with new values.</p>
+<div style="width:400px;margin: 0 auto">
+  <div class="form-field"><label>Room Size</label><input id="ROOM_SIZE" type="range" min="5" max="51" step="2" value="5"/><span>&nbsp;</span></div>
+  <div class="form-field"><label>Scale</label><input id="SCALE" type="range" min="1" max="32" step="1" value="16"/><span>&nbsp;</span></div>
+  <div class="form-field"><label>Iterations</label><input id="ITERATIONS" type="range" min="1" max="32" step="1" value="16"/><span>&nbsp;</span></div>
+</div>
+<p><strong>Explanation</strong><br/></br>
+Each room is a byte, using each bit as connection feature in one of the
+cardinal directions (north, east, south, west) <code>WWSSEENN</code>.
+A Connection feature is either a door, or an open wall. Doors are stored in
+odd bits, walls are stored in even bits <code>WDWDWDWD</code>.
+</p>
+<p>
+At a given position, generate a random byte value, where either a door bit or
+a wall bit is set, but not both. No random value is generated, if given
+recursion depth has been reached. Recursion ends because there's no new
+opening feature from random, a room already exists, or next room position will
+be out of bounds.<br/>
+Scan around the current position for existing
+rooms and merge their connection features, such that the current room contain
+the opposing feature. If the room to the south has a north door, enable the
+south door for the current room, connecting both rooms. If the west door has
+no east door or open wall, disable the west door or west wall in the current
+room.<br/>Add the room to the grid at the given position.
+</p>
+<p>
+Scan around the given position again. If there is a connection feature in the
+current room for the cardinal direction, and not already a room present, or out
+of bounds, recurse with the next position, passing along the previous
+connection feature. The next recursion will use the opposing feature of the
+previous feature, ie if passed a west door the next room will include an east
+door.
+</p>
+<p>
+
+</p>
+<script>
+  var Param = {
+    // width and height of rooms in pixels
+    ROOM_SIZE: 5,
+    // larger scale for bigger pixels
+    SCALE: 16,
+    ITERATIONS: 20
+  }
+
+  // enum for room features,
+  // *_DOOR: room has a door at direction
+  // *_WALL: room is open at direction
+  // DOOR and WALL are interleaved so a shift by 4 will result in a feature in
+  // the opposite direction. Simplified: NorthDoor << 4 == SouthDoor
+  var Feature = {
+    NorthDoor: 2 ** 0,
+    NorthWall: 2 ** 1,
+    EastDoor: 2 ** 2,
+    EastWall: 2 ** 3,
+    SouthDoor: 2 ** 4,
+    SouthWall: 2 ** 5,
+    WestDoor: 2 ** 6,
+    WestWall: 2 ** 7,
+    ALL: 256
+  }
+  Feature.DOOR_MASK = Feature.NorthDoor | Feature.EastDoor | Feature.SouthDoor | Feature.WestDoor
+  Feature.WALL_MASK = Feature.NorthWall | Feature.EastWall | Feature.SouthWall | Feature.WestWall
+
+  // used when testing for rooms at grid coordinates
+  var OFFSET = [
+      {x: 0, y: -1}, {x: 0, y: -1}, {x: 1, y: 0}, {x: 1, y: 0},
+      {x: 0, y: 1}, {x: 0, y: 1}, {x: -1, y: 0}, {x: -1, y: 0}
+  ]
+
+  function offset(x, y, dir) {
+    return {x: x + OFFSET[dir].x, y: y + OFFSET[dir].y}
+  }
+
+  function assert(value, expected) {
+    if (value !== expected)
+      throw new Error(`${value} !== ${expected}`)
+  }
+
+  function clamp(val, min, max) {
+    return Math.max(min, Math.min(max, val))
+  }
+
+  function Grid(width, height, cells) {
+    this.width = width
+    this.height = height
+    if (cells !== undefined)
+      this.cells = cells
+    else
+      this.cells = new Array(this.width * this.height).fill(0)
+  }
+  Grid.prototype.within = function(x, y) {
+    return x >= 0 && x < this.width && y >= 0 && y < this.height
+  }
+  Grid.prototype.set = function(x, y, value) {
+    x = clamp(x, 0, this.width - 1)
+    y = clamp(y, 0, this.height - 1)
+    this.cells[y * this.width + x] = value
+  }
+  Grid.prototype.get = function(x, y) {
+    x = clamp(x, 0, this.width - 1)
+    y = clamp(y, 0, this.height - 1)
+    return this.cells[y * this.width + x]
+  }
+
+  function not(value) {
+    // javascript bitwise not (~value) results in sign bit flip
+    // making value a signed value, make it unsigned
+    return ~value >>> 0
+  }
+
+  function rotl(val, shiftCount, size) {
+    // rotate bits left by shiftCount and wrap at size
+    var shiftCount = shiftCount % size
+    var sizeMask = (1 << size) - 1
+    return (
+      (val << shiftCount) & sizeMask
+      | (val & sizeMask) >> (size - shiftCount)
+    )
+  }
+  assert(rotl(1, 1, 8), 2)
+  assert(rotl(1 << 7, 1, 8), 1)
+
+  function shiftFeature(features) {
+    return rotl(features, 4, 8)
+  }
+  assert(shiftFeature(Feature.NorthDoor), Feature.SouthDoor)
+  assert(shiftFeature(Feature.WestWall), Feature.EastWall)
+
+  function mergeFeatures(a, b, dir) {
+    // mask is expected to be a single set bit, one of the *_DOOR bits.
+    // this is adding the corresponding *_WALL bit
+    var mask = dir | rotl(dir, 1, 8)
+    b = shiftFeature(b) & mask
+    return (a & not(mask) | b)
+  }
+
+  assert(
+    mergeFeatures(
+      Feature.WestDoor | Feature.EastDoor,
+      Feature.SouthDoor | Feature.EastDoor,
+      Feature.WestDoor
+    ),
+    Feature.EastDoor | Feature.WestDoor
+  )
+  assert(
+    mergeFeatures(
+      Feature.WestDoor | Feature.EastDoor,
+      Feature.SouthDoor | Feature.EastWall,
+      Feature.WestDoor
+    ),
+    Feature.WestWall | Feature.EastDoor
+  )
+  assert(
+    mergeFeatures(
+      Feature.DOOR_MASK,
+      0,
+      Feature.WestDoor
+    ),
+    Feature.NorthDoor | Feature.SouthDoor | Feature.EastDoor
+  )
+
+  /*
+    If an adjacent room has a connecting feature, create the corresponding
+    feature in the current room.
+
+    For example, if the room to the north has a door at south, create a north
+    door in the current room to connect both.
+
+    Another example, if the room to the north has no south door, but the
+    current room has a north door, remove the north door.
+  */
+  function mergeAdjacent(grid, x, y, features) {
+    for (var i = 0; i < 8; i += 2) {
+      var dir = 1 << i
+      var dir1 = 1 << (i + 1)
+      var o = offset(x, y, i)
+      // if the offset is outside of the grid, remove any connecting features
+      // in that direction
+      if (!grid.within(o.x, o.y)) {
+        features &= not(dir | dir1)
+      }
+      else {
+        var existingFeatures = grid.get(o.x, o.y)
+        if (existingFeatures !== 0) {
+          features = mergeFeatures(features, existingFeatures, dir)
+        }
+      }
+    }
+    return features;
+  }
+  assert(mergeAdjacent(
+    new Grid(3, 3, [0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    1, 1,
+    Feature.DOOR_MASK
+  ), Feature.DOOR_MASK)
+  assert(mergeAdjacent(
+    new Grid(3, 3, [
+      0, Feature.NorthDoor, 0,
+      Feature.WestDoor, 0, Feature.EastDoor,
+      0, Feature.SouthDoor, 0
+    ]),
+    1, 1,
+    Feature.DOOR_MASK
+  ), 0)
+
+  function randomInt(min, max) {
+      min = Math.ceil(min)
+      max = Math.floor(max)
+      return Math.floor(Math.random() * (max - min + 1)) + min
+  }
+
+  function generateFeatures(previous) {
+    var randomDoors = Math.floor(Math.random() * Feature.ALL)
+    var randomWalls = Math.floor(Math.random() * Feature.ALL)
+    var doors = (randomDoors & Feature.DOOR_MASK) | (previous & Feature.DOOR_MASK)
+    var walls = (randomWalls & Feature.WALL_MASK) | (previous & Feature.WALL_MASK)
+    // combine doors and walls
+    // shift door bits into wall bits and invert for a mask to not
+    // place walls were there are doors
+    var door_mask = not(rotl(doors, 1, 8))
+    return walls & door_mask | doors
+  }
+
+  function generateRooms(grid, x, y, previous, iter) {
+    previous = shiftFeature(previous)
+    var features = previous
+    if (iter > 0) {
+      features = generateFeatures(previous)
+    }
+    // first pass merges surrounding opposing features
+    features = mergeAdjacent(grid, x, y, features)
+    grid.set(x, y, features)
+    // second pass generates new random features
+    // and recurses if grid position is free
+    for (var i = 0; i < 8; i++) {
+      var dir = 1 << i
+      var o = offset(x, y, i)
+      if (!grid.within(o.x, o.y)) {
+        continue
+      }
+      var existingFeatures = grid.get(o.x, o.y)
+      var hasFeature = (features & dir) !== 0
+      var isNotPrevious = dir !== previous
+      var gridIsFree = existingFeatures === 0
+      if (hasFeature && isNotPrevious && gridIsFree) {
+        generateRooms(grid, o.x, o.y, dir, iter - 1)
+      }
+    }
+  }
+
+  function strokePath(ctx, x1, y1, x2, y2) {
+    ctx.beginPath()
+    ctx.moveTo(x1, y1)
+    ctx.lineTo(x2, y2)
+    ctx.stroke()
+  }
+
+  function drawRoomFeatures(ctx, cx, cy, features) {
+    var doorSize = Math.round(Param.ROOM_SIZE / 3)
+    if ((features & Feature.NorthDoor) !== 0) {
+      strokePath(ctx, cx + doorSize, cy + .5, cx + Param.ROOM_SIZE - doorSize, cy + .5)
+    }
+    if ((features & Feature.NorthWall) !== 0) {
+      strokePath(ctx, cx + 1, cy + .5, cx + Param.ROOM_SIZE - 1, cy + .5)
+    }
+    if ((features & Feature.EastDoor) !== 0) {
+      strokePath(ctx, cx + Param.ROOM_SIZE - .5, cy + doorSize, cx + Param.ROOM_SIZE - .5, cy + Param.ROOM_SIZE - doorSize)
+    }
+    if ((features & Feature.EastWall) !== 0) {
+      strokePath(ctx, cx + Param.ROOM_SIZE - .5, cy + 1, cx + Param.ROOM_SIZE - .5, cy + Param.ROOM_SIZE - 1)
+    }
+    if ((features & Feature.SouthDoor) !== 0) {
+      strokePath(ctx, cx + doorSize, cy + Param.ROOM_SIZE - .5, cx + Param.ROOM_SIZE - doorSize, cy + Param.ROOM_SIZE - .5)
+    }
+    if ((features & Feature.SouthWall) !== 0) {
+      strokePath(ctx, cx + 1, cy + Param.ROOM_SIZE - .5, cx + Param.ROOM_SIZE - 1, cy + Param.ROOM_SIZE - .5)
+    }
+    if ((features & Feature.WestDoor) !== 0) {
+      strokePath(ctx, cx + .5, cy + doorSize, cx + .5, cy + Param.ROOM_SIZE - doorSize)
+    }
+    if ((features & Feature.WestWall) !== 0) {
+      strokePath(ctx, cx + .5, cy + 1, cx + .5, cy + Param.ROOM_SIZE - 1)
+    }
+  }
+
+  function drawRoom(ctx, grid, gx, gy) {
+    var features = grid.get(gx, gy)
+    if (features == 0) {
+      return
+    }
+    var cx = gx * Param.ROOM_SIZE
+    var cy = gy * Param.ROOM_SIZE
+
+    ctx.save()
+    ctx.fillStyle = "rgba(128,128,128,1)"
+    ctx.fillRect(cx, cy, Param.ROOM_SIZE, Param.ROOM_SIZE)
+    ctx.fillStyle = "rgba(64,64,64,1)"
+    ctx.fillRect(cx + 1, cy + 1, Param.ROOM_SIZE - 2, Param.ROOM_SIZE - 2)
+    ctx.strokeStyle = "rgba(64, 64, 64, 1)"
+    drawRoomFeatures(ctx, cx, cy, features)
+    ctx.restore()
+
+    ctx.save()
+    ctx.strokeStyle = "rgba(0, 0, 0, .1)"
+    ctx.scale(1/Param.SCALE, 1/Param.SCALE)
+    ctx.strokeRect(cx * Param.SCALE + .5, cy * Param.SCALE + .5, Param.ROOM_SIZE * Param.SCALE - 1, Param.ROOM_SIZE * Param.SCALE -1)
+    ctx.restore()
+  }
+
+  function generate() {
+    var canvas = document.getElementById("canvas")
+    var ctx = canvas.getContext("2d")
+    ctx.save()
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    var grid = new Grid(
+      parseInt(canvas.width / Param.SCALE / Param.ROOM_SIZE),
+      parseInt(canvas.height / Param.SCALE / Param.ROOM_SIZE))
+    generateRooms(grid,
+      parseInt(grid.width / 2),
+      parseInt(grid.height / 2),
+      0,
+      Param.ITERATIONS
+    )
+    ctx.scale(Param.SCALE, Param.SCALE)
+    for (var gx = 0; gx < grid.width; gx++) {
+      for (var gy = 0; gy < grid.height; gy++) {
+        drawRoom(ctx, grid, gx, gy)
+      }
+    }
+    ctx.restore()
+  }
+  canvas.onclick = function() {generate()}
+
+  function onInputParamChange(e) {
+    var elem = e.target
+    Param[elem.id] = parseInt(elem.value)
+    elem.nextSibling.innerHTML = elem.value
+    generate()
+  }
+  function initRange(elem) {
+    elem.onchange = onInputParamChange
+    elem.nextSibling.innerHTML = elem.value
+    var list = document.createElement("datalist")
+    list.id = elem.id + "-list"
+    var min = parseInt(elem.getAttribute("min")),
+      max = parseInt(elem.getAttribute("max")),
+      step = parseInt(elem.getAttribute("step"))
+    for (var i = min; i <= max; i += step) {
+      var opt = document.createElement("option")
+      opt.value = i
+      opt.label = "" + i
+      list.appendChild(opt)
+    }
+    elem.appendChild(list)
+    elem.setAttribute("list", list.id)
+  }
+  initRange(document.getElementById("ROOM_SIZE"))
+  initRange(document.getElementById("SCALE"))
+  initRange(document.getElementById("ITERATIONS"))
+
+  generate()
+</script>
+</body>
+</html>
